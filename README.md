@@ -1,10 +1,6 @@
 # Face Re-Identification with SCRFD and ArcFace
 
-![Downloads](https://img.shields.io/github/downloads/yakhyo/face-reidentification/total) 
-[![GitHub Repo stars](https://img.shields.io/github/stars/yakhyo/face-reidentification)](https://github.com/yakhyo/face-reidentification/stargazers)
-[![GitHub Repository](https://img.shields.io/badge/GitHub-Repository-blue?logo=github)](https://github.com/yakhyo/face-reidentification)
 
-<!--
 <h5 align="center"> If you like our project, please give us a star ⭐ on GitHub for the latest updates.</h5>
 -->
 
@@ -12,7 +8,6 @@
 
 This repository implements face re-identification using SCRFD for face detection and ArcFace for face recognition. It supports inference from webcam or video sources.
 
-## Features (Updated on: 2024.07.29)
 
 - [x] Smaller versions of SCFRD face detection model has been added
 - [x] **Face Detection**: Utilizes [Sample and Computation Redistribution for Efficient Face Detection](https://arxiv.org/abs/2105.04714) (SCRFD) for efficient and accurate face detection. (Updated on: 2024.07.29)
@@ -21,67 +16,8 @@ This repository implements face re-identification using SCRFD for face detection
   - Added models: ArcFace MobileFace (12.99 MB)
 - [x] **Real-Time Inference**: Supports both webcam and video file input for real-time processing.
 
-Project folder structure:
 
-```
-├── assets/
-│   ├── demo.mp4
-│   └── in_video.mp4
-├── faces/
-│   ├── face1.jpg
-│   ├── face2.jpg
-│   └── ...
-├── models/
-│   ├── __init__.py
-│   ├── scrfd.py
-│   └── arcface.py
-├── weights/
-│   ├── det_10g.onnx
-│   ├── det_2.5g.onnx
-│   ├── det_500m.onnx
-│   ├── w600k_r50.onnx
-│   └── w600k_mbf.onnx
-├── utils/
-│   └── helpers.py
-├── main.py
-├── README.md
-└── requirements.txt
-```
-
-## Installation
-
-1. Clone the repository:
-
-```bash
-git clone https://github.com/yakyo/face-reidentification.git
-cd face-reidentification
-```
-
-2. Install the required dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-3. Download weight files:
-
-   a) Download weights from following links:
-
-   | Model              | Weights                                                                                                   | Size     | Type             |
-   | ------------------ | --------------------------------------------------------------------------------------------------------- | -------- | ---------------- |
-   | SCRFD 500M         | [det_500m.onnx](https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/det_500m.onnx)   | 2.41 MB  | Face Detection   |
-   | SCRFD 2.5G         | [det_2.5g.onnx](https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/det_2.5g.onnx)   | 3.14 MB  | Face Detection   |
-   | SCRFD 10G          | [det_10g.onnx](https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/det_10g.onnx)     | 16.1 MB  | Face Detection   |
-   | ArcFace MobileFace | [w600k_mbf.onnx](https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/w600k_mbf.onnx) | 12.99 MB | Face Recognition |
-   | ArcFace ResNet-50  | [w600k_r50.onnx](https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/w600k_r50.onnx) | 166 MB   | Face Recognition |
-
-   b) Run below command to download weights to `weights` directory (linux):
-
-   ```bash
-   sh download.sh
-   ```
-
-4. Put target faces into `faces` folder
+Put target faces into `faces` folder
 
 ```
 faces/
