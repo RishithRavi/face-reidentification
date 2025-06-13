@@ -1,0 +1,28 @@
+{
+    "Richie": {
+        "full_name": "Richie",
+        "role": "Student",
+        "schedule": [
+            {
+                "time": "06:00-08:00",
+                "class": "Math",
+                "room": "Room C431"
+            },
+            {
+                "time": "08:00-10:00",
+                "class": "English",
+                "room": "Room D256"
+            },
+            {
+                "time": "10:00-12:00",
+                "class": "Science",
+                "room": "Room D212"
+            },
+            {
+                "time": "12:00-14:00",
+                "class": "History",
+                "room": "Room D432"
+            }
+        ]
+    }
+}
