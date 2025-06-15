@@ -3,4 +3,6 @@ onnxruntime==1.18.1
 opencv-python==4.9.0.80
 numpy>=1.21.6,<2.0
 scikit-image==0.23.2
-faiss-cpu==1.7.4
+ultralytics
+torch
+pyttsx3

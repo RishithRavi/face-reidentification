@@ -239,7 +239,6 @@ def main():
                 if processing_times:
                     avg_process_time = sum(processing_times) / len(processing_times)
                     avg_faces = sum(face_counts) / len(face_counts)
-                    logging.info(f"FPS: {fps_display:.1f}, Avg process time: {avg_process_time*1000:.1f}ms, Avg faces: {avg_faces:.1f}")
                     
                     # Reset lists to avoid memory growth
                     processing_times = []

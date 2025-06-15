@@ -6,8 +6,12 @@ import argparse
 import logging
 import numpy as np
 import time
+import json
 import tkinter as tk
 from tkinter import simpledialog
+from datetime import datetime
+import pyttsx3
+import threading
 
 from models import SCRFD, ArcFace
 from utils.helpers import compute_similarity, draw_bbox_info, draw_bbox
@@ -20,6 +24,11 @@ selected_face_bbox = None
 selected_face_kps = None
 current_frame = None
 mouse_pos = (0, 0)
+
+# TTS and metadata globals
+tts_engine = None
+person_metadata = {}
+announced_persons = set()  # Track who we've announced recently
 
 
 def parse_args():
@@ -78,6 +87,18 @@ def parse_args():
         default=10,
         help="Interval (in frames) to update performance metrics"
     )
+    parser.add_argument(
+        "--metadata-file",
+        type=str,
+        default="./person_metadata.json",
+        help="Path to person metadata JSON file"
+    )
+    parser.add_argument(
+        "--announcement-cooldown",
+        type=int,
+        default=30,
+        help="Cooldown period in seconds between announcements for the same person"
+    )
 
     return parser.parse_args()
 
@@ -87,6 +108,147 @@ def setup_logging(level: str) -> None:
         level=getattr(logging, level.upper(), None),
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+
+
+def init_tts():
+    """Initialize text-to-speech engine"""
+    global tts_engine
+    try:
+        tts_engine = pyttsx3.init()
+        # Set speech rate (optional)
+        tts_engine.setProperty('rate', 150)
+        # Set volume (optional)
+        tts_engine.setProperty('volume', 0.8)
+        logging.info("Text-to-speech engine initialized")
+    except Exception as e:
+        logging.error(f"Failed to initialize TTS engine: {e}")
+        tts_engine = None
+
+
+def speak_async(text):
+    """Speak text asynchronously to avoid blocking the main thread"""
+    def speak():
+        if tts_engine:
+            try:
+                tts_engine.say(text)
+                tts_engine.runAndWait()
+            except Exception as e:
+                logging.error(f"TTS error: {e}")
+    
+    if tts_engine:
+        thread = threading.Thread(target=speak, daemon=True)
+        thread.start()
+
+
+def load_person_metadata(metadata_file):
+    """Load person metadata from JSON file"""
+    global person_metadata
+    
+    try:
+        with open(metadata_file, 'r') as f:
+            person_metadata = json.load(f)
+        logging.info(f"Loaded metadata for {len(person_metadata)} people")
+    except Exception as e:
+        logging.error(f"Failed to load metadata file {metadata_file}: {e}")
+        person_metadata = {}
+
+
+def get_current_class(person_name):
+    """Get current class for a person based on current time"""
+    if person_name not in person_metadata:
+        logging.warning(f"Metadata not found for {person_name}")
+        return None
+    
+    person_data = person_metadata[person_name]
+    if "schedule" not in person_data:
+        logging.warning(f"Schedule not found for {person_name}")
+        return None
+
+    schedule_data = person_data["schedule"]
+    now = datetime.now()
+    current_time = now.time()
+    
+    daily_schedule_entries = []
+
+    if isinstance(schedule_data, dict): # Handles old format (schedule per day)
+        current_day = now.strftime("%A")
+        if current_day not in schedule_data:
+            logging.info(f"No schedule for {person_name} on {current_day}")
+            return None
+        daily_schedule_entries = schedule_data[current_day]
+    elif isinstance(schedule_data, list): # Handles new format (flat list of schedules)
+        daily_schedule_entries = schedule_data
+    else:
+        logging.error(f"Unknown schedule format for {person_name}: {type(schedule_data)}. Expected dict or list.")
+        return None
+
+    if not isinstance(daily_schedule_entries, list):
+        logging.error(f"Processed schedule for {person_name} is not a list: {type(daily_schedule_entries)}")
+        return None
+
+    logging.debug(f"Checking schedule for {person_name} at {current_time}. Schedule items: {len(daily_schedule_entries)}")
+
+    for class_info in daily_schedule_entries:
+        if not isinstance(class_info, dict):
+            logging.warning(f"Skipping non-dict schedule item for {person_name}: {class_info}")
+            continue
+
+        time_range = class_info.get("time")
+        if not time_range:
+            logging.warning(f"Missing 'time' in class_info for {person_name}: {class_info}")
+            continue
+            
+        try:
+            start_time_str, end_time_str = time_range.split("-")
+            start_time = datetime.strptime(start_time_str, "%H:%M").time()
+            end_time = datetime.strptime(end_time_str, "%H:%M").time()
+            
+            logging.debug(f"Checking class: {class_info.get('class')}, time: {start_time_str}-{end_time_str}. Current time: {current_time}")
+            if start_time <= current_time < end_time: # Corrected condition
+                logging.info(f"Current class for {person_name}: {class_info.get('class')} ({time_range})")
+                return class_info
+        except ValueError as e:
+            logging.error(f"Error parsing time range '{time_range}' for {person_name}: {e}")
+            continue
+        except Exception as e: 
+            logging.error(f"Unexpected error processing schedule item {class_info} for {person_name}: {e}")
+            continue
+            
+    logging.info(f"No current class found for {person_name} at {current_time}")
+    return None
+
+
+def announce_person(person_name):
+    """Announce person's current class via TTS"""
+    global announced_persons
+    
+    # Check if we've recently announced this person
+    current_time = time.time()
+    person_key = f"{person_name}_{int(current_time // 30)}"  # 30-second buckets
+    
+    if person_key in announced_persons:
+        return
+    
+    # Clean old announcements (older than 2 minutes)
+    announced_persons = {key for key in announced_persons 
+                        if int(current_time // 30) - int(key.split('_')[1]) < 4}
+    
+    announced_persons.add(person_key)
+    
+    current_class = get_current_class(person_name)
+    
+    if current_class:
+        announcement = f"Hello {person_name}! You should be in {current_class['class']} right now, in {current_class['room']}"
+    else:
+        # Check if person exists in metadata
+        if person_name in person_metadata:
+            role = person_metadata[person_name].get("role", "person")
+            announcement = f"Hello {person_name}! No scheduled class at this time. You are registered as a {role}."
+        else:
+            announcement = f"Hello {person_name}! Welcome!"
+    
+    logging.info(f"Announcing: {announcement}")
+    speak_async(announcement)
 
 
 def mouse_callback(event, x, y, flags, param):
@@ -251,8 +413,18 @@ def frame_processor(
         else:
             # Normal recognition mode
             if best_match_name != "Unknown":
+                # Announce the person if not recently announced
+                announce_person(best_match_name)
+                
                 color = colors.get(best_match_name, (0, 255, 0))
-                draw_bbox_info(frame, bbox_coords, similarity=max_similarity, name=best_match_name, color=color)
+                
+                # Add current class info to display
+                current_class = get_current_class(best_match_name)
+                display_name = best_match_name
+                if current_class:
+                    display_name += f" | {current_class['class']}"
+                
+                draw_bbox_info(frame, bbox_coords, similarity=max_similarity, name=display_name, color=color)
             else:
                 draw_bbox(frame, bbox_coords, (255, 0, 0))
     
@@ -267,6 +439,10 @@ def main():
     
     params = parse_args()
     setup_logging(params.log_level)
+
+    # Initialize TTS and load metadata
+    init_tts()
+    load_person_metadata(params.metadata_file)
 
     logging.info("Initializing models...")
     detector = SCRFD(params.det_weight, input_size=(640, 640), conf_thres=params.confidence_thresh)
@@ -341,7 +517,6 @@ def main():
                 if processing_times:
                     avg_process_time = sum(processing_times) / len(processing_times)
                     avg_faces = sum(face_counts) / len(face_counts)
-                    logging.info(f"FPS: {fps_display:.1f}, Avg process time: {avg_process_time*1000:.1f}ms, Avg faces: {avg_faces:.1f}")
                     
                     # Reset lists to avoid memory growth
                     processing_times = []

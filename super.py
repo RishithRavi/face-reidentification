@@ -13,6 +13,7 @@ from datetime import datetime
 import pyttsx3
 import threading
 
+from ultralytics import YOLO
 from models import SCRFD, ArcFace
 from utils.helpers import compute_similarity, draw_bbox_info, draw_bbox
 
@@ -28,7 +29,7 @@ mouse_pos = (0, 0)
 # TTS and metadata globals
 tts_engine = None
 person_metadata = {}
-announced_persons = set()  # Track who we've announced recently
+threat_states = {} # Track threat status of detected persons
 
 
 def parse_args():
@@ -98,6 +99,12 @@ def parse_args():
         type=int,
         default=30,
         help="Cooldown period in seconds between announcements for the same person"
+    )
+    parser.add_argument(
+        "--gun-det-weight",
+        type=str,
+        default="./best.pt",
+        help="Path to gun detection model weight"
     )
 
     return parser.parse_args()
@@ -258,34 +265,84 @@ def create_default_metadata(metadata_file):
 
 
 def get_current_class(person_name):
-    """Get current class for a person based on current time"""
+    """
+    Get current class for a person based on current time
+    """
     if person_name not in person_metadata:
+        logging.warning(f"Metadata not found for {person_name}")
         return None
-    
-    now = datetime.now()
-    current_day = now.strftime("%A")
-    current_time = now.time()
-    
+
     person_data = person_metadata[person_name]
-    if current_day not in person_data["schedule"]:
+    if "schedule" not in person_data:
+        logging.warning(f"Schedule not found for {person_name}")
         return None
-    
-    schedule = person_data["schedule"][current_day]
-    
-    for class_info in schedule:
-        time_range = class_info["time"]
-        start_time_str, end_time_str = time_range.split("-")
-        
+
+    schedule_data = person_data["schedule"]
+    now = datetime.now()
+    current_time = now.time()
+
+    daily_schedule_entries = []
+    if isinstance(schedule_data, dict):
+        current_day = now.strftime("%A")
+        if current_day not in schedule_data:
+            logging.info(f"No schedule for {person_name} on {current_day}")
+            return None
+        daily_schedule_entries = schedule_data[current_day]
+    elif isinstance(schedule_data, list):
+        daily_schedule_entries = schedule_data
+    else:
+        logging.error(f"Unknown schedule format for {person_name}: {type(schedule_data)}. Expected dict or list.")
+        return None
+
+    for class_info in daily_schedule_entries:
+        time_range = class_info.get("time")
+        if not time_range:
+            continue
+
         try:
+            start_time_str, end_time_str = time_range.split("-")
             start_time = datetime.strptime(start_time_str, "%H:%M").time()
             end_time = datetime.strptime(end_time_str, "%H:%M").time()
-            
-            if start_time <= current_time <= end_time:
+
+            if start_time <= current_time < end_time:
                 return class_info
-        except ValueError:
+        except ValueError as e:
+            logging.warning(f"Could not parse time range '{time_range}' for {person_name}: {e}")
             continue
-    
+
     return None
+
+
+def check_bbox_intersection(person_bbox, gun_bbox, overlap_thresh=0.1):
+    """
+    Check if a person's bounding box intersects with a gun's bounding box.
+
+    Args:
+        person_bbox (list): Bounding box of the person [x1, y1, x2, y2].
+        gun_bbox (list): Bounding box of the gun [x1, y1, x2, y2].
+        overlap_thresh (float): The threshold for intersection over union (IoU).
+
+    Returns:
+        bool: True if the bounding boxes intersect significantly, False otherwise.
+    """
+    px1, py1, px2, py2 = person_bbox
+    gx1, gy1, gx2, gy2 = gun_bbox
+
+    # Calculate intersection area
+    ix1 = max(px1, gx1)
+    iy1 = max(py1, gy1)
+    ix2 = min(px2, gx2)
+    iy2 = min(py2, gy2)
+    inter_area = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+
+    # Calculate person's bounding box area
+    person_area = (px2 - px1) * (py2 - py1)
+    if person_area == 0:
+        return False
+
+    # Check if intersection is significant
+    overlap = inter_area / person_area
+    return overlap > overlap_thresh
 
 
 def announce_person(person_name):
@@ -431,6 +488,7 @@ def frame_processor(
     frame,
     detector,
     recognizer,
+    gun_detector,
     targets,
     colors,
     params
@@ -449,59 +507,118 @@ def frame_processor(
     Returns:
         Tuple[np.ndarray, int, np.ndarray, np.ndarray]: The processed video frame, number of faces detected, bboxes, and keypoints.
     """
-    global face_labeling_mode, selected_face_bbox, selected_face_kps
+    global face_labeling_mode, selected_face_bbox, selected_face_kps, threat_states
     
-    # Start timing
-    start_time = time.time()
+    start_time_proc = time.time()
     
-    bboxes, kpss = detector.detect(frame, params.max_num)
-    num_faces = len(bboxes)
+    bboxes_det, kpss_det = detector.detect(frame, params.max_num)
+    num_faces = len(bboxes_det)
     
-    for bbox, kps in zip(bboxes, kpss):
-        *bbox_coords, conf_score = bbox.astype(np.int32)
-        embedding = recognizer(frame, kps)
+    gun_results_frame = None
+    if gun_detector:
+        gun_results_frame = gun_detector(frame, verbose=False)
 
-        max_similarity = 0
+    for bbox_data, kps_data in zip(bboxes_det, kpss_det):
+        face_bbox_coords = bbox_data[:4].astype(int)
+        embedding = recognizer(frame, kps_data)
+
+        max_similarity = 0.0
         best_match_name = "Unknown"
-        for target, name in targets:
-            similarity = compute_similarity(target, embedding)
+        for target_embedding, known_name in targets:
+            similarity = compute_similarity(target_embedding, embedding)
             if similarity > max_similarity and similarity > params.similarity_thresh:
                 max_similarity = similarity
-                best_match_name = name
+                best_match_name = known_name
 
-        # Determine color and draw bbox
+        if best_match_name != "Unknown" and best_match_name not in threat_states:
+            threat_states[best_match_name] = {
+                'is_threat': False,
+                'last_gun_seen_time': 0,
+                'weapon_in_view': False,
+                'sitrep_announced': False
+            }
+
+        face_x1, face_y1, face_x2, face_y2 = face_bbox_coords
+        face_h = face_y2 - face_y1
+        face_w = face_x2 - face_x1
+        person_body_box = [
+            max(0, face_x1 - face_w), 
+            face_y1, 
+            min(frame.shape[1], face_x2 + face_w), 
+            min(frame.shape[0], face_y2 + 3 * face_h)
+        ]
+
+        person_has_gun = False
+        if gun_detector and gun_results_frame and gun_results_frame[0].boxes:
+            for gun_box_data in gun_results_frame[0].boxes.data:
+                gun_confidence = gun_box_data[4].item()
+                if gun_confidence >= 0.80:
+                    detected_gun_bbox = gun_box_data[:4].cpu().numpy().astype(int)
+                    cv2.rectangle(frame, (detected_gun_bbox[0], detected_gun_bbox[1]), (detected_gun_bbox[2], detected_gun_bbox[3]), (0, 0, 255), 2)
+                    cv2.putText(frame, f"Firearm ({gun_confidence:.2f})", (detected_gun_bbox[0], detected_gun_bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                    if check_bbox_intersection(person_body_box, detected_gun_bbox):
+                        person_has_gun = True
+        
+        if best_match_name != "Unknown":
+            current_time = time.time()
+            state = threat_states[best_match_name]
+
+            if person_has_gun:
+                # --- WEAPON IS VISIBLE ---
+                if state['is_threat'] and not state['weapon_in_view']:
+                    # This is the TRANSITION from NOT IN VIEW -> IN VIEW
+                    speak_async("Threat's weapon is back in view.")
+                
+                # Update state for weapon being visible
+                state['is_threat'] = True
+                state['weapon_in_view'] = True
+                state['last_gun_seen_time'] = current_time
+
+                # Announce the initial threat details if not already done
+                if not state['sitrep_announced']:
+                    class_info = get_current_class(best_match_name)
+                    announcement = f"Threat identified as {best_match_name}."
+                    if class_info:
+                        announcement += f" Current class would be {class_info['class']} in {class_info['room']}."
+                    speak_async(announcement)
+                    state['sitrep_announced'] = True
+            
+            else: # person_has_gun is False
+                # --- WEAPON IS NOT VISIBLE ---
+                # Check if the person is a known threat and the weapon was previously in view
+                if state['is_threat'] and state['weapon_in_view']:
+                    # This is the TRANSITION from IN VIEW -> NOT IN VIEW
+                    # Check if enough time has passed since it was last seen
+                    if current_time - state['last_gun_seen_time'] > 5.0:
+                        speak_async("Threat's weapon not in view.")
+                        # Update the state to reflect the weapon is no longer in view
+                        state['weapon_in_view'] = False
+        
         if face_labeling_mode:
-            # Highlight faces differently in labeling mode
-            if selected_face_bbox is not None and np.array_equal(bbox[:4], selected_face_bbox[:4]):
-                # Selected face - bright yellow
+            if selected_face_bbox is not None and np.array_equal(bbox_data[:4], selected_face_bbox[:4]):
                 color = (0, 255, 255)
-                draw_bbox_info(frame, bbox_coords, similarity=max_similarity, name=f"SELECTED: {best_match_name}", color=color)
+                draw_bbox_info(frame, face_bbox_coords, similarity=max_similarity, name=f"SELECTED: {best_match_name}", color=color)
             else:
-                # Clickable faces - cyan
                 color = (255, 255, 0)
-                draw_bbox_info(frame, bbox_coords, similarity=max_similarity, name=f"CLICK: {best_match_name}", color=color)
-        else:
-            # Normal recognition mode
+                draw_bbox_info(frame, face_bbox_coords, similarity=max_similarity, name=f"CLICK: {best_match_name}", color=color)
+        else: # Recognition mode
+            display_name_on_box = best_match_name
+            box_color = colors.get(best_match_name, (0, 255, 0))
+
             if best_match_name != "Unknown":
-                # Announce the person if not recently announced
-                announce_person(best_match_name)
+                if threat_states[best_match_name]['is_threat']:
+                    box_color = (0, 0, 255)
                 
-                color = colors.get(best_match_name, (0, 255, 0))
-                
-                # Add current class info to display
-                current_class = get_current_class(best_match_name)
-                display_name = best_match_name
-                if current_class:
-                    display_name += f" | {current_class['class']}"
-                
-                draw_bbox_info(frame, bbox_coords, similarity=max_similarity, name=display_name, color=color)
-            else:
-                draw_bbox(frame, bbox_coords, (255, 0, 0))
+                current_class_info = get_current_class(best_match_name)
+                if current_class_info:
+                    display_name_on_box += f" | {current_class_info['class']}"
+                draw_bbox_info(frame, face_bbox_coords, similarity=max_similarity, name=display_name_on_box, color=box_color)
+            else: # Unknown person
+                box_color = (0, 0, 255) if person_has_gun else (255, 0, 0)
+                draw_bbox_info(frame, face_bbox_coords, similarity=0, name="Unknown", color=box_color)
     
-    # End timing
-    process_time = time.time() - start_time
-    
-    return frame, num_faces, process_time, bboxes, kpss
+    process_time_val = time.time() - start_time_proc
+    return frame, num_faces, process_time_val, bboxes_det, kpss_det
 
 
 def main():
@@ -517,13 +634,21 @@ def main():
     logging.info("Initializing models...")
     detector = SCRFD(params.det_weight, input_size=(640, 640), conf_thres=params.confidence_thresh)
     recognizer = ArcFace(params.rec_weight)
+    # Initialize Gun Detector (YOLO)
+    logging.info("Initializing Gun Detector (YOLO)...")
+    try:
+        gun_detector = YOLO(params.gun_det_weight)  # Load the YOLO model for gun detection
+        logging.info("Gun Detector initialized successfully.")
+    except Exception as e:
+        logging.error(f"Error initializing Gun Detector: {e}")
+        gun_detector = None # Ensure gun_detector is defined even if loading fails
     logging.info("Models initialized successfully")
 
     targets = build_targets(detector, recognizer, params)
     colors = {name: (random.randint(0, 256), random.randint(0, 256), random.randint(0, 256)) for _, name in targets}
 
-    logging.info(f"Opening webcam (device ID: {params.camera_id})...")
-    cap = cv2.VideoCapture(params.camera_id)
+    logging.info(f"Opening webcam (device ID: {params.camera_id}) using DSHOW backend...")
+    cap = cv2.VideoCapture(params.camera_id, cv2.CAP_DSHOW)
     
     if not cap.isOpened():
         logging.error(f"Could not open webcam with ID {params.camera_id}")
@@ -556,19 +681,22 @@ def main():
     
     try:
         while True:
+            # print("DEBUG: Attempting cap.read()", flush=True) # Commented out for now
             ret, frame = cap.read()
-            if not ret:
-                logging.error("Failed to grab frame from webcam")
+            if not ret or frame is None:
+                logging.error("Failed to grab frame from webcam after cap.read()")
+                # print("DEBUG: cap.read() failed or returned empty frame.", flush=True) # Commented out for now
                 break
 
             current_frame = frame.copy()
-            processed_frame, num_faces, process_time, bboxes, kpss = frame_processor(
-                frame, detector, recognizer, targets, colors, params
+            processed_frame, num_faces, process_time, bboxes_fp, kpss_fp = frame_processor(
+                frame, detector, recognizer, gun_detector, targets, colors, params
             )
             
             # Update mouse callback parameters with current detection results
+            # Note: bboxes and kpss for mouse_callback should come from frame_processor
             cv2.setMouseCallback(window_name, mouse_callback, 
-                               (detector, recognizer, bboxes, kpss, targets, colors, params))
+                               (detector, recognizer, bboxes_fp, kpss_fp, targets, colors, params))
             
             # Track performance metrics
             processing_times.append(process_time)
@@ -578,7 +706,7 @@ def main():
             frame_count += 1
             if frame_count % params.update_interval == 0:
                 elapsed = time.time() - start_time
-                fps_display = params.update_interval / elapsed
+                fps_display = params.update_interval / elapsed if elapsed > 0 else 0 # Avoid division by zero
                 
                 # Reset timing
                 start_time = time.time()
@@ -587,7 +715,6 @@ def main():
                 if processing_times:
                     avg_process_time = sum(processing_times) / len(processing_times)
                     avg_faces = sum(face_counts) / len(face_counts)
-                    logging.info(f"FPS: {fps_display:.1f}, Avg process time: {avg_process_time*1000:.1f}ms, Avg faces: {avg_faces:.1f}")
                     
                     # Reset lists to avoid memory growth
                     processing_times = []
