@@ -1,63 +1,87 @@
-# Face Re-Identification with SCRFD and ArcFace
+# Real-Time Shooter Identification System
 
+<h5 align="center">An advanced, real-time threat detection system that identifies individuals holding firearms by intelligently combining face recognition, gun detection, and pose estimation.</h5>
 
-<h5 align="center"> If you like our project, please give us a star ⭐ on GitHub for the latest updates.</h5>
--->
+<!-- <video controls autoplay loop src="https://github.com/yakhyo/face-reidentification/assets/28424328/441880b0-1e43-4c28-9f63-b32bc9b6e6b4" muted="false" width="100%"></video> -->
 
-<video controls autoplay loop src="https://github.com/yakhyo/face-reidentification/assets/28424328/441880b0-1e43-4c28-9f63-b32bc9b6e6b4" muted="false" width="100%"></video>
+This project provides a robust solution for identifying potential threats in real-time video streams. It uses a multi-layered AI approach to detect faces, firearms, and human poses, then applies a sophisticated logic to determine if a recognized person is holding a gun. Once a threat is identified, the system persistently marks the individual for the remainder of the session.
 
-This repository implements face re-identification using SCRFD for face detection and ArcFace for face recognition. It supports inference from webcam or video sources.
+## Core Features
 
+- **Multi-Modal AI Detection**: Simultaneously runs four different AI models for:
+  - **Face Detection**: High-accuracy SCRFD for locating faces.
+  - **Face Recognition**: ArcFace for identifying known individuals.
+  - **Gun Detection**: YOLOv8 for spotting firearms.
+  - **Pose Estimation**: MediaPipe Pose for tracking body keypoints.
+- **Advanced Threat Association**: Implements a reliable **Face → Pose → Hand → Gun** logic. Instead of just guessing, the system confirms that a detected gun is in close proximity to the hands of a specific, identified person.
+- **Persistent Threat Memory**: Once a person is identified as a shooter, their status is remembered. Their bounding box remains red for the rest of the session, ensuring continuous awareness.
+- **Real-Time Performance**: Utilizes multithreading to run AI inference in a background process, ensuring a smooth, responsive UI on the main video feed.
 
-- [x] Smaller versions of SCFRD face detection model has been added
-- [x] **Face Detection**: Utilizes [Sample and Computation Redistribution for Efficient Face Detection](https://arxiv.org/abs/2105.04714) (SCRFD) for efficient and accurate face detection. (Updated on: 2024.07.29)
-  - Added models: SCRFD 500M (2.41 MB), SCRFD 2.5G (3.14 MB)
-- [x] **Face Recognition**: Employs [ArcFace: Additive Angular Margin Loss for Deep Face Recognition](https://arxiv.org/abs/1801.07698) for robust face recognition. (Updated on: 2024.07.29)
-  - Added models: ArcFace MobileFace (12.99 MB)
-- [x] **Real-Time Inference**: Supports both webcam and video file input for real-time processing.
+## Technology Stack
 
+- **OpenCV**: For video capture and rendering.
+- **SCRFD & ArcFace (ONNX)**: For state-of-the-art face detection and recognition.
+- **YOLOv8 (Ultralytics)**: For real-time object (gun) detection.
+- **MediaPipe**: For accurate and fast human pose estimation.
+- **NumPy**: For efficient numerical operations.
 
-Put target faces into `faces` folder
+## Setup and Installation
 
-```
-faces/
-    ├── name1.jpg
-    ├── name2.jpg
-```
+1.  **Clone the Repository**
+    ```bash
+    git clone https://github.com/RishithRavi/face-reidentification.git
+    cd face-reidentification
+    ```
 
-Those file names will be displayed while real-time inference.
+2.  **Install Dependencies**
+    A `requirements.txt` file is provided for easy setup. 
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+3.  **Download Model Weights**
+    You will need the necessary model weights for the system to function. You can use the provided script to download them.
+    ```bash
+    ./download.sh
+    ```
+
+4.  **Add Known Faces**
+    Place images of people you want the system to recognize into the `faces` directory. The filename (without extension) will be used as the person's name.
+    ```
+    faces/
+        ├── Richie.jpg
+        ├── John.png
+    ```
 
 ## Usage
 
+To run the main application, execute the `base.py` script. The system will start using your primary webcam (source 0) by default.
+
 ```bash
-python main.py --source assets/in_video.mp4
+python base.py
 ```
 
-`main.py` arguments:
+While the application is running:
+- The system will draw boxes around detected faces, guns, and pose keypoints.
+- A **green** box indicates a recognized, non-threatening person.
+- A **red** box indicates a person who has been identified as a shooter.
+- Press **'q'** to quit the application at any time.
 
-```
-usage: main.py [-h] [--det-weight DET_WEIGHT] [--rec-weight REC_WEIGHT] [--similarity-thresh SIMILARITY_THRESH] [--confidence-thresh CONFIDENCE_THRESH]
-               [--faces-dir FACES_DIR] [--source SOURCE] [--max-num MAX_NUM] [--log-level LOG_LEVEL]
+## How It Works
 
-Face Detection-and-Recognition
+The system operates in a continuous loop, performing the following steps on each frame:
 
-options:
-  -h, --help            show this help message and exit
-  --det-weight DET_WEIGHT
-                        Path to detection model
-  --rec-weight REC_WEIGHT
-                        Path to recognition model
-  --similarity-thresh SIMILARITY_THRESH
-                        Similarity threshold between faces
-  --confidence-thresh CONFIDENCE_THRESH
-                        Confidence threshold for face detection
-  --faces-dir FACES_DIR
-                        Path to faces stored dir
-  --source SOURCE       Video file or video camera source. i.e 0 - webcam
-  --max-num MAX_NUM     Maximum number of face detections from a frame
-  --log-level LOG_LEVEL
-                        Logging level
-```
+1.  **Capture & Preprocess**: A frame is captured from the webcam and resized for faster processing.
+2.  **Parallel Inference**: The frame is sent to a background thread that runs all AI models:
+    -   `SCRFD` detects all faces.
+    -   `ArcFace` generates embeddings for each detected face and compares them to the known faces.
+    -   `YOLOv8` detects any guns in the frame.
+    -   `MediaPipe Pose` detects the keypoints for any person in the frame.
+3.  **Threat Association**: The main thread uses the results to apply the core logic:
+    a. For each recognized **face**, it finds the corresponding **pose** by matching the nose keypoint to the face's bounding box.
+    b. It then gets the coordinates of that specific pose's **hands** (wrists).
+    c. Finally, it checks if any detected **gun** is within a close proximity threshold to those hands.
+4.  **Update & Render**: If a person is confirmed to be holding a gun, their name is added to a persistent `identified_threats` set. The system then draws the appropriate colored bounding boxes and labels on the original, full-resolution frame for display.
 
 ## Reference
 

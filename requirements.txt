@@ -1,8 +1,7 @@
-onnx==1.16.1
-onnxruntime==1.18.1
-opencv-python==4.9.0.80
-numpy>=1.21.6,<2.0
-scikit-image==0.23.2
+numpy
+onnxruntime
+opencv-python
 ultralytics
+mediapipe
 torch
-pyttsx3
+torchvision

@@ -14,3 +14,4 @@ wget -O weights/det_500m.onnx https://github.com/yakhyo/face-reidentification/re
 wget -O weights/det_10g.onnx https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/det_10g.onnx
 wget -O weights/w600k_mbf.onnx https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/w600k_mbf.onnx
 wget -O weights/w600k_r50.onnx https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/w600k_r50.onnx
+# wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth -O ./weights/realesr-general-x4v3.pth

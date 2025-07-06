@@ -12,10 +12,17 @@ from tkinter import simpledialog
 from datetime import datetime
 import pyttsx3
 import threading
-
+import queue
+import torch
+import mediapipe as mp
+from mediapipe.python.solutions import pose as mp_pose_solution
+from mediapipe.python.solutions import drawing_utils as mp_drawing
 from ultralytics import YOLO
+from realesrgan import RealESRGANer
+
 from models import SCRFD, ArcFace
 from utils.helpers import compute_similarity, draw_bbox_info, draw_bbox
+from sr_model import get_sr_model
 
 warnings.filterwarnings("ignore")
 
@@ -29,7 +36,12 @@ mouse_pos = (0, 0)
 # TTS and metadata globals
 tts_engine = None
 person_metadata = {}
-threat_states = {} # Track threat status of detected persons
+threat_states = {}
+
+# Super-resolution globals
+sr_check_queue = queue.Queue()
+sr_results = {}
+frame_counter = 0
 
 
 def parse_args():
@@ -106,6 +118,45 @@ def parse_args():
         default="./best.pt",
         help="Path to gun detection model weight"
     )
+    parser.add_argument(
+        "--pose-model-complexity",
+        type=int, default=1, choices=[0, 1, 2],
+        help="Pose model complexity (0=lite, 1=full, 2=heavy)."
+    )
+    parser.add_argument(
+        "--min-pose-detection-confidence",
+        type=float, default=0.5,
+        help="Minimum detection confidence for MediaPipe Pose."
+    )
+    parser.add_argument(
+        "--min-pose-tracking-confidence",
+        type=float, default=0.5,
+        help="Minimum tracking confidence for MediaPipe Pose."
+    )
+    parser.add_argument(
+        "--gun-hand-association-thresh",
+        type=float, default=0.5,
+        help="Minimum gun detection confidence to consider for hand association."
+    )
+    parser.add_argument(
+        "--gun-det-confidence-thresh",
+        type=float,
+        default=0.5,
+        help="Minimum confidence threshold for gun detection."
+    )
+    parser.add_argument(
+        "--gun-hand-proximity-pixels",
+        type=int, default=100,
+        help="Maximum distance in pixels between a detected gun and a hand/wrist to associate them."
+    )
+    parser.add_argument(
+        "--draw-pose",
+        action='store_true',
+        help="Draw detected pose landmarks on the output frame."
+    )
+    parser.add_argument('--enable-sr', action='store_true', help='Enable super-resolution double-check.')
+    parser.add_argument('--sr-model-path', type=str, default='./weights/realesr-general-x4v3.pth', help='Path to the Real-ESRGAN model.')
+    parser.add_argument('--sr-conf-range', type=float, nargs=2, default=[0.5, 0.85], help='Confidence range to trigger SR check.')
 
     return parser.parse_args()
 
@@ -146,6 +197,48 @@ def speak_async(text):
         thread = threading.Thread(target=speak, daemon=True)
         thread.start()
 
+
+
+def get_landmark_coords(landmarks, landmark_id, frame_shape):
+    """Convert normalized MediaPipe landmark to pixel coordinates."""
+    if landmarks and landmark_id < len(landmarks.landmark):
+        landmark = landmarks.landmark[landmark_id]
+        if landmark.visibility < 0.5: # Or some other threshold
+            return None
+        x = int(landmark.x * frame_shape[1])
+        y = int(landmark.y * frame_shape[0])
+        return (x, y)
+    return None
+
+def is_gun_near_hand(gun_bbox, hand_coord_px, proximity_threshold_px):
+    """Check if the center of a gun bounding box is near a hand coordinate."""
+    if hand_coord_px is None or gun_bbox is None:
+        return False
+    gun_center_x = (gun_bbox[0] + gun_bbox[2]) / 2
+    gun_center_y = (gun_bbox[1] + gun_bbox[3]) / 2
+    distance = np.sqrt((gun_center_x - hand_coord_px[0])**2 + (gun_center_y - hand_coord_px[1])**2)
+    return distance < proximity_threshold_px
+
+def find_pose_for_face(face_bbox_coords, pose_results, frame_shape, mp_pose_module):
+    """Finds pose landmarks corresponding to a given face bounding box.
+       Assumes nose landmark (ID 0) should be within the face_bbox.
+    """
+    if not pose_results or not pose_results.pose_landmarks:
+        return None
+
+    face_x1, face_y1, face_x2, face_y2 = face_bbox_coords
+    
+    # Iterate through all detected poses (though typically it's one per person if static_image_mode=False)
+    # For multi-pose detection, you might need a more sophisticated matching logic if pose_results contains multiple poses.
+    # Here, we assume pose_results.pose_landmarks is the primary detected pose or the most relevant one.
+    # If MediaPipe returns multiple pose instances in pose_results.multi_pose_landmarks, you'd iterate through that.
+    
+    # Using pose_results.pose_landmarks (single primary pose)
+    nose_coord = get_landmark_coords(pose_results.pose_landmarks, mp_pose_module.PoseLandmark.NOSE, frame_shape)
+    if nose_coord:
+        if face_x1 <= nose_coord[0] <= face_x2 and face_y1 <= nose_coord[1] <= face_y2:
+            return pose_results.pose_landmarks # Return the full set of landmarks for this pose
+    return None
 
 def load_person_metadata(metadata_file):
     """Load person metadata from JSON file"""
@@ -484,32 +577,67 @@ def build_targets(detector, recognizer, params: argparse.Namespace):
     return targets
 
 
+def sr_worker(q, results_dict, gun_detector, sr_model, high_thresh):
+    while True:
+        frame_id, frame_crop, original_bbox = q.get()
+        enhanced_crop, _ = sr_model.enhance(frame_crop)
+        new_results = gun_detector(enhanced_crop, verbose=False)
+        new_conf = 0
+        if new_results and new_results[0].boxes:
+            new_conf = new_results[0].boxes.data[0][4].item()
+        status = 'confirmed' if new_conf >= high_thresh else 'discarded'
+        if frame_id not in results_dict:
+            results_dict[frame_id] = []
+        results_dict[frame_id].append((original_bbox, new_conf, status))
+        q.task_done()
+
+
 def frame_processor(
     frame,
     detector,
     recognizer,
     gun_detector,
+    pose_model,
     targets,
     colors,
-    params
+    params,
+    frame_id,
+    sr_check_queue,
+    sr_results
 ):
     """
-    Process a video frame for face detection and recognition.
+    Process a video frame for face detection, recognition, and pose-based gun association.
 
     Args:
         frame (np.ndarray): The video frame.
         detector (SCRFD): Face detector model.
         recognizer (ArcFace): Face recognizer model.
+        gun_detector (YOLO): Gun detection model.
+        pose_model (mediapipe.solutions.pose.Pose): MediaPipe Pose model instance.
         targets (List[Tuple[np.ndarray, str]]): List of target feature vectors and names.
         colors (dict): Dictionary of colors for drawing bounding boxes.
         params (argparse.Namespace): Command line arguments.
 
     Returns:
-        Tuple[np.ndarray, int, np.ndarray, np.ndarray]: The processed video frame, number of faces detected, bboxes, and keypoints.
+        Tuple[np.ndarray, int, float, np.ndarray, np.ndarray]: The processed video frame, number of faces, proc time, bboxes, kpss.
     """
     global face_labeling_mode, selected_face_bbox, selected_face_kps, threat_states
     
     start_time_proc = time.time()
+
+    # Convert frame to RGB for MediaPipe
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    rgb_frame.flags.writeable = False # Performance optimization
+    pose_results = pose_model.process(rgb_frame)
+    rgb_frame.flags.writeable = True # Revert for OpenCV drawing
+    # Frame is already BGR, so convert back if needed for other ops, or draw on original 'frame'
+
+    if params.draw_pose and pose_results.pose_landmarks:
+        mp_drawing.draw_landmarks(
+            frame, pose_results.pose_landmarks, mp_pose_solution.POSE_CONNECTIONS,
+            mp_drawing.DrawingSpec(color=(245,117,66), thickness=2, circle_radius=2),
+            mp_drawing.DrawingSpec(color=(245,66,230), thickness=2, circle_radius=2)
+        )
     
     bboxes_det, kpss_det = detector.detect(frame, params.max_num)
     num_faces = len(bboxes_det)
@@ -538,32 +666,50 @@ def frame_processor(
                 'sitrep_announced': False
             }
 
-        face_x1, face_y1, face_x2, face_y2 = face_bbox_coords
-        face_h = face_y2 - face_y1
-        face_w = face_x2 - face_x1
-        person_body_box = [
-            max(0, face_x1 - face_w), 
-            face_y1, 
-            min(frame.shape[1], face_x2 + face_w), 
-            min(frame.shape[0], face_y2 + 3 * face_h)
-        ]
+        # New: Pose-based gun association
+        person_specific_has_gun = False
+        person_pose_landmarks = find_pose_for_face(face_bbox_coords, pose_results, frame.shape, mp_pose_solution)
 
-        person_has_gun = False
-        if gun_detector and gun_results_frame and gun_results_frame[0].boxes:
+        if person_pose_landmarks and gun_detector and gun_results_frame and gun_results_frame[0].boxes:
+            left_wrist_coord = get_landmark_coords(person_pose_landmarks, mp_pose_solution.PoseLandmark.LEFT_WRIST, frame.shape)
+            right_wrist_coord = get_landmark_coords(person_pose_landmarks, mp_pose_solution.PoseLandmark.RIGHT_WRIST, frame.shape)
+            
+            # Optional: Draw wrist circles for debugging
+            # if left_wrist_coord: cv2.circle(frame, left_wrist_coord, 10, (0,255,255), -1)
+            # if right_wrist_coord: cv2.circle(frame, right_wrist_coord, 10, (255,0,255), -1)
+
             for gun_box_data in gun_results_frame[0].boxes.data:
                 gun_confidence = gun_box_data[4].item()
-                if gun_confidence >= 0.80:
+                # Draw all detected guns above general threshold, but associate only if above association_thresh
+                if gun_confidence >= params.gun_det_confidence_thresh: # General detection threshold from params
                     detected_gun_bbox = gun_box_data[:4].cpu().numpy().astype(int)
-                    cv2.rectangle(frame, (detected_gun_bbox[0], detected_gun_bbox[1]), (detected_gun_bbox[2], detected_gun_bbox[3]), (0, 0, 255), 2)
-                    cv2.putText(frame, f"Firearm ({gun_confidence:.2f})", (detected_gun_bbox[0], detected_gun_bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                    if check_bbox_intersection(person_body_box, detected_gun_bbox):
-                        person_has_gun = True
+                    low_thresh, high_thresh = params.sr_conf_range
+
+                    if params.enable_sr and low_thresh <= gun_confidence < high_thresh:
+                        x1, y1, x2, y2 = detected_gun_bbox
+                        crop = frame[y1:y2, x1:x2]
+                        if crop.size > 0:
+                            sr_check_queue.put((frame_id, crop.copy(), detected_gun_bbox))
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                            cv2.putText(frame, f"Verifying... ({gun_confidence:.2f})", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                    elif gun_confidence >= high_thresh:
+                        cv2.rectangle(frame, (detected_gun_bbox[0], detected_gun_bbox[1]), (detected_gun_bbox[2], detected_gun_bbox[3]), (0, 0, 255), 2)
+                        cv2.putText(frame, f"Firearm ({gun_confidence:.2f})", (detected_gun_bbox[0], detected_gun_bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                        
+                        # Check for association only if gun confidence is high enough for association
+                        if gun_confidence >= params.gun_hand_association_thresh:
+                            if (is_gun_near_hand(detected_gun_bbox, left_wrist_coord, params.gun_hand_proximity_pixels) or 
+                                is_gun_near_hand(detected_gun_bbox, right_wrist_coord, params.gun_hand_proximity_pixels)):
+                                person_specific_has_gun = True
+                                # Optionally, highlight the associated gun or hand
+                                cv2.putText(frame, f"ARMED: {best_match_name}", (detected_gun_bbox[0], detected_gun_bbox[1] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+                                break # Associated this person with a gun
         
         if best_match_name != "Unknown":
             current_time = time.time()
             state = threat_states[best_match_name]
 
-            if person_has_gun:
+            if person_specific_has_gun:
                 # --- WEAPON IS VISIBLE ---
                 if state['is_threat'] and not state['weapon_in_view']:
                     # This is the TRANSITION from NOT IN VIEW -> IN VIEW
@@ -614,15 +760,23 @@ def frame_processor(
                     display_name_on_box += f" | {current_class_info['class']}"
                 draw_bbox_info(frame, face_bbox_coords, similarity=max_similarity, name=display_name_on_box, color=box_color)
             else: # Unknown person
-                box_color = (0, 0, 255) if person_has_gun else (255, 0, 0)
+                box_color = (0, 0, 255) if person_specific_has_gun else colors.get(best_match_name, (0, 255, 0))
                 draw_bbox_info(frame, face_bbox_coords, similarity=0, name="Unknown", color=box_color)
-    
+
+    if frame_id in sr_results:
+        for bbox, new_conf, status in sr_results[frame_id]:
+            if status == 'confirmed':
+                cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 2)
+                cv2.putText(frame, f"Confirmed ({new_conf:.2f})", (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        if frame_id > 100:
+            del sr_results[frame_id - 100]
+
     process_time_val = time.time() - start_time_proc
     return frame, num_faces, process_time_val, bboxes_det, kpss_det
 
 
 def main():
-    global face_labeling_mode, selected_face_bbox, selected_face_kps, current_frame
+    global face_labeling_mode, selected_face_bbox, selected_face_kps, current_frame, frame_counter
     
     params = parse_args()
     setup_logging(params.log_level)
@@ -634,6 +788,15 @@ def main():
     logging.info("Initializing models...")
     detector = SCRFD(params.det_weight, input_size=(640, 640), conf_thres=params.confidence_thresh)
     recognizer = ArcFace(params.rec_weight)
+
+    logging.info("Initializing MediaPipe Pose model...")
+    # mp_pose_solution = mp.solutions.pose # Defined globally now for landmark access
+    pose_model = mp_pose_solution.Pose(
+        static_image_mode=False, # Process video stream
+        model_complexity=params.pose_model_complexity,
+        min_detection_confidence=params.min_pose_detection_confidence,
+        min_tracking_confidence=params.min_pose_tracking_confidence
+    )
     # Initialize Gun Detector (YOLO)
     logging.info("Initializing Gun Detector (YOLO)...")
     try:
@@ -641,7 +804,32 @@ def main():
         logging.info("Gun Detector initialized successfully.")
     except Exception as e:
         logging.error(f"Error initializing Gun Detector: {e}")
-        gun_detector = None # Ensure gun_detector is defined even if loading fails
+        gun_detector = None
+
+    sr_model = None
+    if params.enable_sr:
+        logging.info("Initializing Super-Resolution model...")
+        try:
+            model = get_sr_model()
+            sr_model = RealESRGANer(
+                scale=4, 
+                model_path=params.sr_model_path, 
+                model=model, 
+                tile=0, 
+                tile_pad=10, 
+                pre_pad=0, 
+                half=True if torch.cuda.is_available() else False
+            )
+            threading.Thread(
+                target=sr_worker, 
+                args=(sr_check_queue, sr_results, gun_detector, sr_model, params.sr_conf_range[1]), 
+                daemon=True
+            ).start()
+            logging.info("Super-Resolution model initialized successfully.")
+        except Exception as e:
+            logging.error(f"Error initializing Super-Resolution model: {e}")
+            sr_model = None
+
     logging.info("Models initialized successfully")
 
     targets = build_targets(detector, recognizer, params)
@@ -681,6 +869,7 @@ def main():
     
     try:
         while True:
+            frame_counter += 1
             # print("DEBUG: Attempting cap.read()", flush=True) # Commented out for now
             ret, frame = cap.read()
             if not ret or frame is None:
@@ -689,14 +878,14 @@ def main():
                 break
 
             current_frame = frame.copy()
-            processed_frame, num_faces, process_time, bboxes_fp, kpss_fp = frame_processor(
-                frame, detector, recognizer, gun_detector, targets, colors, params
+            processed_frame, num_faces, process_time, bboxes, kpss = frame_processor(
+                frame, detector, recognizer, gun_detector, pose_model, targets, colors, params, frame_counter, sr_check_queue, sr_results
             )
             
             # Update mouse callback parameters with current detection results
             # Note: bboxes and kpss for mouse_callback should come from frame_processor
             cv2.setMouseCallback(window_name, mouse_callback, 
-                               (detector, recognizer, bboxes_fp, kpss_fp, targets, colors, params))
+                               (detector, recognizer, bboxes, kpss, targets, colors, params))
             
             # Track performance metrics
             processing_times.append(process_time)
@@ -804,6 +993,9 @@ def main():
         logging.info("Interrupted by user")
     finally:
         logging.info("Releasing resources...")
+        if 'pose_model' in locals() and pose_model is not None:
+            pose_model.close()
+            logging.info("MediaPipe Pose model released.")
         cap.release()
         cv2.destroyAllWindows()
         logging.info("Done")
