@@ -1,4 +1,18 @@
-numpy
+numpy==1.26.4
+onnxruntime==1.18.0
+ultralytics==8.2.28
+mediapipe==0.10.14
+pyttsx3==2.90
+fastapi
+uvicorn
+python-socketio
+icsr
+torch==2.0.1
+torchvision==0.15.2
+# SR model dependencies
+basicsr
+facexlib
+gfpgan
 onnxruntime
 opencv-python
 ultralytics
