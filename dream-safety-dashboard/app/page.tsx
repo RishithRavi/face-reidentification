@@ -93,6 +93,17 @@ export default function DreamSafetyDashboard() {
     type: string
   }>>([])
   
+  // Pathfinding related states
+  const [currentFloor, setCurrentFloor] = useState("Ground")
+  const [floorPlanImage, setFloorPlanImage] = useState<string | null>(null)
+  const [pathInstructions, setPathInstructions] = useState<string[]>([])
+  const [pathDistance, setPathDistance] = useState(0)
+  const [evacuationRoutes, setEvacuationRoutes] = useState<Array<{
+    destination: string
+    distance: number
+    instructions: string[]
+  }>>([])
+  
   const wsRef = useRef<WebSocket | null>(null)
   const notificationIdRef = useRef(1)
 
@@ -110,79 +121,138 @@ export default function DreamSafetyDashboard() {
 
         ws.onmessage = (event) => {
           try {
-            const data: DetectionData = JSON.parse(event.data)
-            setDetectionData(data)
+            const data = JSON.parse(event.data)
             
-            // Update camera feeds
-            setCameraFeeds(prev => {
-              const existing = prev.findIndex(f => f.location === data.location)
-              const feed = {
-                location: data.location,
-                frame: data.frame,
-                status: data.status,
-                threats: data.detections.threat_count
-              }
+            // Handle different message types
+            if (data.type === "detection_data") {
+              const detectionData: DetectionData = data
+              setDetectionData(detectionData)
               
-              if (existing >= 0) {
-                const updated = [...prev]
-                updated[existing] = feed
-                return updated
-              } else {
-                return [...prev, feed].slice(-4) // Keep only last 4 feeds
-              }
-            })
-            
-            // Process threats
-            if (data.threats.length > 0) {
-              // Set incident timer if first threat
-              if (incidentTimer === 0) {
-                setIncidentTimer(1)
-              }
-              
-              // Update active threat
-              const highestPriorityThreat = data.threats.find(t => t.type === "armed_person") || data.threats[0]
-              setActiveThreat(highestPriorityThreat)
-              
-              // Add to timeline
-              data.threats.forEach(threat => {
-                const timeStr = new Date(threat.timestamp).toLocaleTimeString()
-                const eventMessage = threat.type === "armed_person" 
-                  ? `Armed person: ${threat.person}`
-                  : threat.type === "weapon_detected"
-                  ? `Weapon detected: ${threat.weapon_type}`
-                  : "Unknown threat"
+              // Update camera feeds
+              setCameraFeeds(prev => {
+                const existing = prev.findIndex(f => f.location === detectionData.location)
+                const feed = {
+                  location: detectionData.location,
+                  frame: detectionData.frame,
+                  status: detectionData.status,
+                  threats: detectionData.detections.threat_count
+                }
                 
-                setThreatTimeline(prev => {
-                  const exists = prev.some(t => 
-                    t.time === timeStr && t.event === eventMessage
-                  )
-                  if (!exists) {
-                    return [{
+                if (existing >= 0) {
+                  const updated = [...prev]
+                  updated[existing] = feed
+                  return updated
+                } else {
+                  return [...prev, feed].slice(-4) // Keep only last 4 feeds
+                }
+              })
+              
+              // Process threats
+              if (detectionData.threats.length > 0) {
+                // Set incident timer if first threat
+                if (incidentTimer === 0) {
+                  setIncidentTimer(1)
+                }
+                
+                // Update active threat
+                const highestPriorityThreat = detectionData.threats.find(t => t.type === "armed_person") || detectionData.threats[0]
+                setActiveThreat(highestPriorityThreat)
+                
+                // Add to timeline
+                detectionData.threats.forEach(threat => {
+                  const timeStr = new Date(threat.timestamp).toLocaleTimeString()
+                  const eventMessage = threat.type === "armed_person" 
+                    ? `Armed person: ${threat.person}`
+                    : threat.type === "weapon_detected"
+                    ? `Weapon detected: ${threat.weapon_type}`
+                    : "Unknown threat"
+                  
+                  setThreatTimeline(prev => {
+                    const exists = prev.some(t => 
+                      t.time === timeStr && t.event === eventMessage
+                    )
+                    if (!exists) {
+                      const newEvent: { time: string; event: string; location: string; severity: "high" | "medium" | "low" } = {
+                        time: timeStr,
+                        event: eventMessage,
+                        location: threat.location,
+                        severity: threat.confidence > 0.8 ? "high" : threat.confidence > 0.5 ? "medium" : "low"
+                      };
+                      return [newEvent, ...prev].slice(0, 10); // Keep last 10 events
+
+                    }
+                    return prev
+                  })
+                  
+                  // Add notification
+                  if (threat.confidence > 0.7) {
+                    const notif = {
+                      id: notificationIdRef.current++,
+                      severity: threat.confidence > 0.8 ? "high" as const : "medium" as const,
+                      message: eventMessage,
                       time: timeStr,
-                      event: eventMessage,
-                      location: threat.location,
-                      severity: (threat.confidence > 0.8 ? "high" : "medium") as 'high' | 'medium' | 'low'
-                    }, ...prev].slice(0, 10) // Keep last 10 events
+                      type: threat.type
+                    }
+                    setNotifications(prev => [notif, ...prev].slice(0, 20))
                   }
-                  return prev
                 })
-                
-                // Add notification
-                if (threat.confidence > 0.7) {
+              }
+            }
+            // Handle pathfinding responses
+            else if (data.type === "pathfinding_response") {
+              if (data.request_type === "intercept") {
+                const result = data.data
+                if (result.status === "success") {
+                  setFloorPlanImage(result.floor_plan)
+                  setPathInstructions(result.instructions)
+                  setPathDistance(result.distance)
+                  
+                  // Add notification
                   const notif = {
                     id: notificationIdRef.current++,
-                    severity: threat.confidence > 0.8 ? "high" as const : "medium" as const,
-                    message: eventMessage,
-                    time: timeStr,
-                    type: threat.type
+                    severity: "medium" as const,
+                    message: `Intercept path calculated for ${result.officer}`,
+                    time: new Date().toLocaleTimeString(),
+                    type: "pathfinding"
                   }
                   setNotifications(prev => [notif, ...prev].slice(0, 20))
                 }
-              })
+              } else if (data.request_type === "evacuation") {
+                setEvacuationRoutes(data.data.routes)
+                
+                // Add notification
+                const notif = {
+                  id: notificationIdRef.current++,
+                  severity: "low" as const,
+                  message: `Evacuation routes calculated from ${data.data.location}`,
+                  time: new Date().toLocaleTimeString(),
+                  type: "evacuation"
+                }
+                setNotifications(prev => [notif, ...prev].slice(0, 20))
+              }
+            }
+            // Handle auto-intercept paths
+            else if (data.type === "auto_intercept") {
+              const result = data.data
+              if (result.status === "success") {
+                setFloorPlanImage(result.floor_plan)
+                setPathInstructions(result.instructions)
+                setPathDistance(result.distance)
+                
+                // Add notification with high priority
+                const notif = {
+                  id: notificationIdRef.current++,
+                  severity: "high" as const,
+                  message: `Auto-intercept: ${result.officer} → ${result.threat_location}`,
+                  time: new Date().toLocaleTimeString(),
+                  type: "auto_intercept"
+                }
+                setNotifications(prev => [notif, ...prev].slice(0, 20))
+              }
             }
             
           } catch (error) {
-            console.error("Error parsing detection data:", error)
+            console.error("Error parsing WebSocket data:", error)
           }
         }
 
@@ -256,11 +326,6 @@ export default function DreamSafetyDashboard() {
         e.preventDefault()
         setShowNotifications(!showNotifications)
         break
-      case "r": // Reset/Clear incident
-      case "R":
-        e.preventDefault()
-        handleClearIncident()
-        break
       case "Escape":
         e.preventDefault()
         setShowLockdownConfirm(false)
@@ -292,44 +357,43 @@ export default function DreamSafetyDashboard() {
     return `${mins}:${secs.toString().padStart(2, "0")} ETA`
   }
 
-  const handleClearIncident = () => {
-    // Send clear message to backend
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ action: "clear" }))
+  // Pathfinding functions
+  const requestInterceptPath = (officerId: string) => {
+    if (!wsRef.current || !activeThreat) return
+    
+    const request = {
+      type: "pathfinding_request",
+      request_type: "intercept",
+      officer_id: officerId,
+      threat_location: activeThreat.location
     }
-
-    // Reset frontend state
-    setIncidentTimer(0)
-    setPoliceETA(180) // Reset to initial value
-    setThreatTimeline([])
-    setActiveThreat(null)
-    setNotifications([])
-
-    // Reset detection data to a clear state
-    setDetectionData(prev =>
-      prev
-        ? {
-            ...prev,
-            threats: [],
-            detections: {
-              ...prev.detections,
-              persons: prev.detections.persons.map(p => ({ ...p, is_threat: false })),
-              threat_count: 0,
-            },
-            status: "clear",
-          }
-        : null
-    )
-
-    setCameraFeeds(prev =>
-      prev.map(feed => ({
-        ...feed,
-        status: "clear",
-        threats: 0,
-      }))
-    )
-
-    console.log("Incident cleared.")
+    
+    wsRef.current.send(JSON.stringify(request))
+  }
+  
+  const requestEvacuationRoutes = () => {
+    if (!wsRef.current || !activeThreat) return
+    
+    const request = {
+      type: "pathfinding_request",
+      request_type: "evacuation",
+      location: activeThreat.location
+    }
+    
+    wsRef.current.send(JSON.stringify(request))
+  }
+  
+  const updateOfficerPosition = (officerId: string, position: string) => {
+    if (!wsRef.current) return
+    
+    const request = {
+      type: "pathfinding_request",
+      request_type: "update_officer",
+      officer_id: officerId,
+      position: position
+    }
+    
+    wsRef.current.send(JSON.stringify(request))
   }
 
   // Calculate student accounting based on detections
@@ -367,9 +431,6 @@ export default function DreamSafetyDashboard() {
           </div>
           <div>
             <kbd className="bg-muted px-1 rounded">N</kbd> Notifications
-          </div>
-          <div>
-            <kbd className="bg-muted px-1 rounded">R</kbd> Reset Incident
           </div>
           <div>
             <kbd className="bg-muted px-1 rounded">?</kbd> Help
@@ -578,20 +639,35 @@ export default function DreamSafetyDashboard() {
               <CardHeader className="pb-3">
                 <CardTitle className="flex items-center gap-2">
                   <MapPin className="h-5 w-5" />
-                  School Floor Plan - Ground Level
+                  School Floor Plan - {currentFloor}
                   {mapFocused && (
                     <Badge variant="outline" className="ml-2 text-xs">
                       Focused
                     </Badge>
                   )}
                   <div className="ml-auto flex gap-1">
-                    <Button size="sm" variant="outline" className="h-7 text-xs bg-transparent">
+                    <Button 
+                      size="sm" 
+                      variant={currentFloor === "Ground" ? "outline" : "ghost"}
+                      className="h-7 text-xs bg-transparent"
+                      onClick={() => setCurrentFloor("Ground")}
+                    >
                       Ground
                     </Button>
-                    <Button size="sm" variant="ghost" className="h-7 text-xs">
+                    <Button 
+                      size="sm" 
+                      variant={currentFloor === "Floor 1" ? "outline" : "ghost"}
+                      className="h-7 text-xs"
+                      onClick={() => setCurrentFloor("Floor 1")}
+                    >
                       Floor 1
                     </Button>
-                    <Button size="sm" variant="ghost" className="h-7 text-xs">
+                    <Button 
+                      size="sm" 
+                      variant={currentFloor === "Floor 2" ? "outline" : "ghost"}
+                      className="h-7 text-xs"
+                      onClick={() => setCurrentFloor("Floor 2")}
+                    >
                       Floor 2
                     </Button>
                   </div>
@@ -599,24 +675,74 @@ export default function DreamSafetyDashboard() {
               </CardHeader>
               <CardContent className="h-full">
                 <div className="bg-slate-100 rounded-lg h-full relative overflow-hidden min-h-[400px]">
-                  <img
-                    src="/placeholder.svg?height=500&width=800"
-                    alt="School Floor Plan"
-                    className="w-full h-full object-cover"
-                  />
-                  {/* Threat location */}
-                  {activeThreat && (
-                    <div className="absolute top-1/3 left-1/2 w-6 h-6 bg-red-500 rounded-full animate-pulse border-2 border-white shadow-lg flex items-center justify-center">
-                      <AlertTriangle className="h-3 w-3 text-white" />
+                  {floorPlanImage ? (
+                    <img
+                      src={`data:image/jpeg;base64,${floorPlanImage}`}
+                      alt="School Floor Plan with Path"
+                      className="w-full h-full object-contain"
+                    />
+                  ) : (
+                    <img
+                      src="/placeholder.svg?height=500&width=800"
+                      alt="School Floor Plan"
+                      className="w-full h-full object-cover"
+                    />
+                  )}
+                  
+                  {/* Path Instructions Overlay */}
+                  {pathInstructions.length > 0 && (
+                    <div className="absolute top-4 left-4 bg-white/95 backdrop-blur-sm rounded-lg p-3 max-w-xs max-h-48 overflow-y-auto">
+                      <div className="text-xs font-semibold mb-2 flex items-center gap-1">
+                        <Navigation className="h-3 w-3" />
+                        Navigation Instructions
+                      </div>
+                      <div className="space-y-1">
+                        {pathInstructions.map((instruction, idx) => (
+                          <div key={idx} className="text-xs flex items-start gap-1">
+                            <span className="text-slate-400">{idx + 1}.</span>
+                            <span>{instruction}</span>
+                          </div>
+                        ))}
+                      </div>
+                      {pathDistance > 0 && (
+                        <div className="text-xs font-semibold mt-2 text-emerald-600">
+                          Distance: {pathDistance.toFixed(0)}m
+                        </div>
+                      )}
                     </div>
                   )}
-                  {/* Officer positions */}
-                  <div className="absolute bottom-1/4 left-1/4 w-4 h-4 bg-blue-500 rounded-full border-2 border-white flex items-center justify-center">
-                    <div className="w-2 h-2 bg-white rounded-full"></div>
+                  
+                  {/* Officer Controls */}
+                  <div className="absolute bottom-4 right-4 bg-white/95 backdrop-blur-sm rounded-lg p-3">
+                    <div className="text-xs font-semibold mb-2">Officer Controls</div>
+                    <div className="space-y-2">
+                      <Button 
+                        size="sm" 
+                        className="w-full text-xs bg-blue-600 hover:bg-blue-700"
+                        onClick={() => requestInterceptPath("Officer1")}
+                        disabled={!activeThreat}
+                      >
+                        Officer 1 → Intercept
+                      </Button>
+                      <Button 
+                        size="sm" 
+                        className="w-full text-xs bg-blue-600 hover:bg-blue-700"
+                        onClick={() => requestInterceptPath("Officer2")}
+                        disabled={!activeThreat}
+                      >
+                        Officer 2 → Intercept
+                      </Button>
+                      <Button 
+                        size="sm" 
+                        variant="outline"
+                        className="w-full text-xs bg-transparent"
+                        onClick={requestEvacuationRoutes}
+                      >
+                        Show Evacuation Routes
+                      </Button>
+                    </div>
                   </div>
-                  <div className="absolute top-1/4 right-1/3 w-4 h-4 bg-blue-500 rounded-full border-2 border-white flex items-center justify-center">
-                    <div className="w-2 h-2 bg-white rounded-full"></div>
-                  </div>
+                  
                   {/* Legend */}
                   <div className="absolute bottom-4 left-4 bg-white/90 backdrop-blur-sm rounded-lg p-3 text-xs space-y-1">
                     <div className="flex items-center gap-2">
@@ -626,6 +752,14 @@ export default function DreamSafetyDashboard() {
                     <div className="flex items-center gap-2">
                       <div className="w-3 h-3 bg-blue-500 rounded-full"></div>
                       <span>Officers</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="w-3 h-0.5 bg-red-500"></div>
+                      <span>Intercept Path</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="w-3 h-0.5 bg-purple-500"></div>
+                      <span>Stairs</span>
                     </div>
                   </div>
                 </div>

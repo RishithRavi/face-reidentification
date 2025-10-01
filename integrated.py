@@ -387,7 +387,7 @@ class CombinedDetectorWithPathfinding:
     
     async def handle_pathfinding_request(self, request_data):
         """Handle pathfinding requests from the dashboard"""
-        request_type = request_data.get("type")
+        request_type = request_data.get("type") or request_data.get("request_type")
         
         if request_type == "intercept":
             # Calculate intercept path for officer to threat
@@ -471,6 +471,7 @@ def create_detection_payload(face_detections, gun_detections, frame, location="M
         
         persons.append(person_data)
     
+    timestamp = datetime.now().isoformat()
     weapons = []
     for bbox, label in gun_detections:
         confidence = float(label.split()[-1])
@@ -480,21 +481,52 @@ def create_detection_payload(face_detections, gun_detections, frame, location="M
             "confidence": confidence,
             "bbox": bbox.tolist(),
             "location": location,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": timestamp
         })
-        
-        if confidence > 0.7:
+
+    # Generate threats based on detections
+    if weapons:
+        recognized_persons = [p for p in persons if p["name"] != "Unknown"]
+        armed_person_threats = [p for p in persons if p.get("is_threat")]
+        first_weapon = weapons[0]
+
+        # Prioritize explicitly identified shooters
+        if armed_person_threats:
+            for person in armed_person_threats:
+                # Avoid duplicate threats if already added
+                if not any(t["type"] == "armed_person" and t["person"] == person["name"] for t in threats):
+                    threats.append({
+                        "type": "armed_person",
+                        "person": person["name"],
+                        "weapon_type": first_weapon["weapon_type"],
+                        "confidence": person["confidence"],
+                        "location": location,
+                        "timestamp": timestamp
+                    })
+        # If a gun is detected and a known person is in frame, associate it
+        elif recognized_persons:
+            person = recognized_persons[0]
+            threats.append({
+                "type": "armed_person",
+                "person": person["name"],
+                "weapon_type": first_weapon["weapon_type"],
+                "confidence": person["confidence"],
+                "location": location,
+                "timestamp": timestamp
+            })
+        # Otherwise, create a general weapon threat
+        else:
             threats.append({
                 "type": "weapon_detected",
-                "weapon_type": label.split()[0],
-                "confidence": confidence,
+                "weapon_type": first_weapon["weapon_type"],
+                "confidence": first_weapon["confidence"],
                 "location": location,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": timestamp
             })
     
     return {
         "type": "detection_data",
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": timestamp,
         "location": location,
         "frame": frame_base64,
         "detections": {
